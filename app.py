@@ -11,6 +11,29 @@ from config import (
 app = Flask(__name__)
 
 # =====================================================
+# Mapas de tradução
+# =====================================================
+
+STATUS_MAP = {
+    "backlog": "Backlog",
+    "todo": "A Fazer",
+    "to do": "A Fazer",
+    "in_progress": "Em andamento",
+    "in progress": "Em andamento",
+    "doing": "Em andamento",
+    "done": "Finalizado",
+    "completed": "Finalizado"
+}
+
+PRIORITY_MAP = {
+    "none": "Sem prioridade",
+    "low": "Baixa",
+    "medium": "Média",
+    "high": "Alta",
+    "urgent": "Urgente"
+}
+
+# =====================================================
 # Utils
 # =====================================================
 
@@ -27,6 +50,12 @@ def normalizar(valor, padrao="N/A"):
     if valor in [None, "", [], {}, "none"]:
         return padrao
     return valor
+
+
+def traduzir(valor: str, mapa: dict, padrao="N/A"):
+    if not valor:
+        return padrao
+    return mapa.get(valor.lower(), valor)
 
 
 def lista_para_texto(lista, campo="name", padrao="Nenhuma"):
@@ -59,7 +88,6 @@ def plane_webhook():
     event = payload.get("event")
     action = payload.get("action")
 
-    # Trabalhamos apenas com issues
     if event != "issue":
         return jsonify({"status": "ignored_event"}), 200
 
@@ -67,7 +95,7 @@ def plane_webhook():
     activity = payload.get("activity", {})
 
     # -------------------------------------------------
-    # 🔒 FILTRO POR PROJETO (SUPORTE TI - HELP DESK)
+    # 🔒 Filtro por projeto
     # -------------------------------------------------
     project_id = data.get("project")
 
@@ -82,8 +110,12 @@ def plane_webhook():
     numero = normalizar(data.get("sequence_id"))
     titulo = normalizar(data.get("name"), "Sem título")
 
-    status = normalizar(data.get("state", {}).get("name"))
-    prioridade = normalizar(data.get("priority"))
+    status_raw = data.get("state", {}).get("name")
+    prioridade_raw = data.get("priority")
+
+    status = traduzir(status_raw, STATUS_MAP)
+    prioridade = traduzir(prioridade_raw, PRIORITY_MAP)
+
     pontos = normalizar(data.get("point"))
 
     responsaveis = lista_para_texto(
@@ -99,7 +131,14 @@ def plane_webhook():
     )
 
     inicio = normalizar(data.get("start_date"), "—")
-    prazo = normalizar(data.get("target_date"), "—")
+
+    # 👉 Prazo / Finalizado
+    if status == "Finalizado":
+        prazo_label = "Finalizado em"
+        prazo = normalizar(data.get("updated_at"), "—")
+    else:
+        prazo_label = "Prazo"
+        prazo = normalizar(data.get("target_date"), "—")
 
     autor = activity.get("actor", {}).get("display_name", "Usuário")
 
@@ -108,16 +147,16 @@ def plane_webhook():
     # =================================================
 
     if action == "created":
-        header_title = "🆕 Nova Issue criada"
+        header_title = "🆕 Nova Tarefa Criada"
     elif action == "updated":
-        header_title = "✏️ Issue atualizada"
+        header_title = "✏️ Tarefa Atualizada"
     elif action == "deleted":
-        header_title = "🗑️ Issue removida"
+        header_title = "🗑️ Tarefa Removida"
     else:
-        header_title = "📌 Evento de Issue"
+        header_title = "📌 Evento de Tarefa"
 
     # =================================================
-    # Card Google Chat (Cards V2 – compatível)
+    # Card Google Chat (Cards V2)
     # =================================================
 
     mensagem = {
@@ -143,7 +182,7 @@ def plane_webhook():
                             "widgets": [
                                 {"decoratedText": {"topLabel": "Pontos", "text": str(pontos)}},
                                 {"decoratedText": {"topLabel": "Início", "text": inicio}},
-                                {"decoratedText": {"topLabel": "Prazo", "text": prazo}},
+                                {"decoratedText": {"topLabel": prazo_label, "text": prazo}},
                             ]
                         },
                         {
