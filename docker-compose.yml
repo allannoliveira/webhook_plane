@@ -1,0 +1,18 @@
+services:
+  app:
+    build: .
+    container_name: webhook_plane
+    ports:
+      - "5500:5500"
+    restart: always
+    volumes:
+      - ./google_service_account.json:/app/google_service_account.json:ro
+      - ./config.py:/app/config.py:ro
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflare_tunnel
+    command: tunnel --no-autoupdate --url http://app:5500
+    depends_on:
+      - app
+    restart: always
