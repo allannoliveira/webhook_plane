@@ -1,7 +1,14 @@
 import hmac
 import hashlib
+import json
+import threading
+import time
+from datetime import datetime, timezone
+
+import gspread
 import requests
 from flask import Flask, request, jsonify
+from google.oauth2.service_account import Credentials
 from config import (
     PLANE_SECRET,
     GOOGLE_CHAT_WEBHOOK,
@@ -11,26 +18,128 @@ from config import (
 app = Flask(__name__)
 
 # =====================================================
-# Mapas de tradução
+# Cache de deduplicacao (em memoria)
+# =====================================================
+
+_ultimo_evento: dict = {}
+_dedup_lock = threading.Lock()
+DEDUP_JANELA_SEGUNDOS = 5
+
+# Set de issues atualmente sendo processadas pelo worker (evita duplo disparo)
+_issues_processando: set = set()
+_processando_lock = threading.Lock()
+
+
+def ja_processado_recentemente(issue_id: str) -> bool:
+    agora = time.time()
+    with _dedup_lock:
+        ultimo = _ultimo_evento.get(issue_id)
+        if ultimo and (agora - ultimo) < DEDUP_JANELA_SEGUNDOS:
+            return True
+        _ultimo_evento[issue_id] = agora
+        return False
+
+
+# =====================================================
+# Google Sheets -- configuracao
+# =====================================================
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SPREADSHEET_ID = "1QZbabFKLsvcnGJn5VsXbT99vupJvAV-U22_3dC4CDzk"
+SHEET_NAME = "Sheet1"
+DEBOUNCE_SEGUNDOS = 30
+
+_sheets_lock = threading.Lock()
+
+
+def get_sheet():
+    creds = Credentials.from_service_account_file(
+        "google_service_account.json",
+        scopes=SCOPES
+    )
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+
+def garantir_cabecalho(sheet):
+    primeira = sheet.row_values(1)
+    if not primeira:
+        sheet.append_row(
+            ["issue_id", "ultimo_evento", "dados_json", "status_enviado"],
+            value_input_option="RAW"
+        )
+
+
+def buscar_linha(sheet, issue_id: str):
+    registros = sheet.get_all_values()
+    for i, row in enumerate(registros[1:], start=2):
+        if row and row[0] == issue_id:
+            return i, row
+    return None, None
+
+
+def salvar_pendente(issue_id: str, dados: dict):
+    with _sheets_lock:
+        sheet = get_sheet()
+        garantir_cabecalho(sheet)
+        agora = datetime.now(timezone.utc).isoformat()
+        row_idx, _ = buscar_linha(sheet, issue_id)
+        if row_idx:
+            sheet.update(
+                values=[[issue_id, agora, json.dumps(dados, ensure_ascii=False), "pendente"]],
+                range_name=f"A{row_idx}:D{row_idx}"
+            )
+        else:
+            sheet.append_row(
+                [issue_id, agora, json.dumps(dados, ensure_ascii=False), "pendente"],
+                value_input_option="RAW"
+            )
+
+
+def marcar_status_sheet(issue_id: str, status: str):
+    with _sheets_lock:
+        sheet = get_sheet()
+        row_idx, _ = buscar_linha(sheet, issue_id)
+        if row_idx:
+            sheet.update_cell(row_idx, 4, status)
+
+
+# =====================================================
+# Mapas de traducao
 # =====================================================
 
 STATUS_MAP = {
-    "backlog": "Backlog",
-    "todo": "A Fazer",
-    "to do": "A Fazer",
+    "backlog":     "Backlog",
+    "todo":        "A Fazer",
+    "to do":       "A Fazer",
     "in_progress": "Em andamento",
     "in progress": "Em andamento",
-    "doing": "Em andamento",
-    "done": "Finalizado",
-    "completed": "Finalizado"
+    "doing":       "Em andamento",
+    "done":        "Finalizado",
+    "completed":   "Finalizado"
 }
 
 PRIORITY_MAP = {
-    "none": "Sem prioridade",
-    "low": "Baixa",
-    "medium": "Média",
-    "high": "Alta",
+    "none":   "Sem prioridade",
+    "low":    "Baixa",
+    "medium": "Media",
+    "high":   "Alta",
     "urgent": "Urgente"
+}
+
+PRIORITY_EMOJI = {
+    "Sem prioridade": "",
+    "Baixa":          "🔽",
+    "Media":          "🔶",
+    "Alta":           "🔴",
+    "Urgente":        "🚨"
+}
+
+STATUS_EMOJI = {
+    "Backlog":       "📋",
+    "A Fazer":       "📝",
+    "Em andamento":  "⚙️",
+    "Finalizado":    "✅"
 }
 
 # =====================================================
@@ -66,15 +175,259 @@ def lista_para_texto(lista, campo="name", padrao="Nenhuma"):
 
 
 # =====================================================
+# Montar e enviar card Google Chat
+# =====================================================
+
+def enviar_google_chat(dados: dict):
+    action   = dados.get("action")
+    data     = dados.get("data", {})
+    activity = dados.get("activity", {})
+
+    numero         = normalizar(data.get("sequence_id"))
+    titulo         = normalizar(data.get("name"), "Sem titulo")
+    status_raw     = data.get("state", {}).get("name")
+    prioridade_raw = data.get("priority")
+    status         = traduzir(status_raw, STATUS_MAP)
+    prioridade     = traduzir(prioridade_raw, PRIORITY_MAP)
+    pontos         = normalizar(data.get("point"))
+    responsaveis   = lista_para_texto(data.get("assignees", []), campo="display_name", padrao="Nao atribuido")
+    labels         = lista_para_texto(data.get("labels", []), campo="name", padrao="Nenhuma")
+    inicio         = normalizar(data.get("start_date"), "-")
+    autor          = activity.get("actor", {}).get("display_name", "Usuario")
+
+    status_emoji    = STATUS_EMOJI.get(status, "📌")
+    prioridade_emoji = PRIORITY_EMOJI.get(prioridade, "")
+
+    if status == "Finalizado":
+        prazo_label = "Finalizado em"
+        prazo = normalizar(data.get("updated_at"), "-")
+    else:
+        prazo_label = "Prazo"
+        prazo = normalizar(data.get("target_date"), "-")
+
+    # Titulo do header por acao
+    if action == "created":
+        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/add_task/default/48px.svg"
+        header_title = "Nova Tarefa Criada"
+        header_color = "#0F9D58"
+    elif action == "updated":
+        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/edit/default/48px.svg"
+        header_title = "Tarefa Atualizada"
+        header_color = "#4285F4"
+    elif action == "deleted":
+        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/delete/default/48px.svg"
+        header_title = "Tarefa Removida"
+        header_color = "#EA4335"
+    else:
+        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/task/default/48px.svg"
+        header_title = "Evento de Tarefa"
+        header_color = "#9E9E9E"
+
+    # Linha de prioridade com emoji
+    prioridade_texto = f"{prioridade_emoji} {prioridade}".strip() if prioridade_emoji else prioridade
+
+    # Linha de pontos
+    pontos_texto = f"🎯 {pontos}" if pontos != "N/A" else "🎯 Sem estimativa"
+
+    # Responsavel
+    responsaveis_texto = f"👤 {responsaveis}"
+
+    # Labels
+    labels_texto = f"🏷️ {labels}"
+
+    # Datas
+    inicio_texto = f"📅 Inicio: {inicio}"
+    prazo_texto  = f"⏰ {prazo_label}: {prazo}"
+
+    # Rodape
+    rodape = f"✏️ Atualizado por <b>{autor}</b>"
+
+    mensagem = {
+        "cardsV2": [{
+            "cardId": "plane-issue",
+            "card": {
+                "header": {
+                    "title": f"<b>{header_title}</b>",
+                    "subtitle": f"#{numero}  •  {titulo}",
+                    "imageUrl": header_icon,
+                    "imageType": "CIRCLE"
+                },
+                "sections": [
+                    {
+                        # Bloco principal: status + titulo destacado
+                        "widgets": [
+                            {
+                                "textParagraph": {
+                                    "text": f"<b>{titulo}</b>"
+                                }
+                            },
+                            {
+                                "decoratedText": {
+                                    "startIcon": {"knownIcon": "BOOKMARK"},
+                                    "topLabel": "Status",
+                                    "text": f"{status_emoji}  <b>{status}</b>"
+                                }
+                            },
+                            {
+                                "decoratedText": {
+                                    "startIcon": {"knownIcon": "STAR"},
+                                    "topLabel": "Prioridade",
+                                    "text": prioridade_texto
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        # Bloco secundario: responsavel, labels, pontos
+                        "widgets": [
+                            {
+                                "decoratedText": {
+                                    "startIcon": {"knownIcon": "PERSON"},
+                                    "topLabel": "Responsavel",
+                                    "text": responsaveis
+                                }
+                            },
+                            {
+                                "decoratedText": {
+                                    "startIcon": {"knownIcon": "DESCRIPTION"},
+                                    "topLabel": "Labels",
+                                    "text": labels
+                                }
+                            },
+                            {
+                                "decoratedText": {
+                                    "startIcon": {"knownIcon": "FLIGHT_ARRIVAL"},
+                                    "topLabel": "Pontos",
+                                    "text": str(pontos)
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        # Bloco de datas
+                        "widgets": [
+                            {
+                                "columns": {
+                                    "columnItems": [
+                                        {
+                                            "horizontalSizeStyle": "FILL_AVAILABLE_SPACE",
+                                            "widgets": [{
+                                                "decoratedText": {
+                                                    "startIcon": {"knownIcon": "INVITE"},
+                                                    "topLabel": "Inicio",
+                                                    "text": inicio
+                                                }
+                                            }]
+                                        },
+                                        {
+                                            "horizontalSizeStyle": "FILL_AVAILABLE_SPACE",
+                                            "widgets": [{
+                                                "decoratedText": {
+                                                    "startIcon": {"knownIcon": "CLOCK"},
+                                                    "topLabel": prazo_label,
+                                                    "text": prazo
+                                                }
+                                            }]
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        # Rodape
+                        "widgets": [
+                            {
+                                "textParagraph": {
+                                    "text": rodape
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        }]
+    }
+
+    resp = requests.post(
+        GOOGLE_CHAT_WEBHOOK,
+        json=mensagem,
+        headers={"Content-Type": "application/json; charset=UTF-8"},
+        timeout=5
+    )
+    print("Google Chat status:", resp.status_code)
+    if resp.status_code != 200:
+        print("Google Chat response:", resp.text)
+
+
+# =====================================================
+# Background worker -- verifica debounce a cada 10s
+# =====================================================
+
+def worker_debounce():
+    while True:
+        time.sleep(10)
+        try:
+            with _sheets_lock:
+                sheet = get_sheet()
+                registros = sheet.get_all_values()
+
+            agora = datetime.now(timezone.utc)
+
+            for i, row in enumerate(registros[1:], start=2):
+                if len(row) < 4:
+                    continue
+
+                issue_id, ultimo_evento_str, dados_json, status_enviado = row[:4]
+
+                if status_enviado != "pendente":
+                    continue
+
+                try:
+                    ultimo_evento = datetime.fromisoformat(ultimo_evento_str)
+                except ValueError:
+                    continue
+
+                if ultimo_evento.tzinfo is None:
+                    ultimo_evento = ultimo_evento.replace(tzinfo=timezone.utc)
+
+                if (agora - ultimo_evento).total_seconds() < DEBOUNCE_SEGUNDOS:
+                    continue
+
+                # Bloqueia em memoria para evitar duplo disparo entre ciclos
+                with _processando_lock:
+                    if issue_id in _issues_processando:
+                        continue
+                    _issues_processando.add(issue_id)
+
+                marcar_status_sheet(issue_id, "processando")
+
+                try:
+                    dados = json.loads(dados_json)
+                    enviar_google_chat(dados)
+                    marcar_status_sheet(issue_id, "enviado")
+                    print(f"[debounce] Alerta enviado para issue {issue_id}")
+                except Exception as e:
+                    marcar_status_sheet(issue_id, "pendente")
+                    print(f"[debounce] Erro ao enviar issue {issue_id}: {e}")
+                finally:
+                    with _processando_lock:
+                        _issues_processando.discard(issue_id)
+
+        except Exception as e:
+            print(f"[worker_debounce] Erro geral: {e}")
+
+
+threading.Thread(target=worker_debounce, daemon=True).start()
+
+
+# =====================================================
 # Webhook Plane
 # =====================================================
 
 @app.route("/webhooks/plane", methods=["POST"])
 def plane_webhook():
-    # -------------------------------------------------
-    # Validação da assinatura
-    # -------------------------------------------------
-    raw_body = request.get_data()
+    raw_body  = request.get_data()
     signature = request.headers.get("X-Plane-Signature")
 
     if not signature:
@@ -84,136 +437,40 @@ def plane_webhook():
         return jsonify({"error": "invalid signature"}), 401
 
     payload = request.json or {}
-
-    event = payload.get("event")
-    action = payload.get("action")
+    event   = payload.get("event")
+    action  = payload.get("action")
 
     if event != "issue":
         return jsonify({"status": "ignored_event"}), 200
 
     data = payload.get("data", {})
-    activity = payload.get("activity", {})
 
-    # -------------------------------------------------
-    # 🔒 Filtro por projeto
-    # -------------------------------------------------
+    # Filtro por projeto
     project_id = data.get("project")
-
     if project_id != PLANE_PROJECT_ID:
         print(f"Ignorado projeto {project_id}")
         return jsonify({"status": "ignored_project"}), 200
 
-    # =================================================
-    # Dados da Issue
-    # =================================================
+    issue_id = data.get("id")
+    if not issue_id:
+        return jsonify({"error": "missing issue id"}), 400
 
-    numero = normalizar(data.get("sequence_id"))
-    titulo = normalizar(data.get("name"), "Sem título")
+    # Deduplicacao -- ignora se ja recebemos um evento dessa issue nos ultimos 5s
+    if ja_processado_recentemente(issue_id):
+        print(f"[dedup] Evento duplicado ignorado para issue {issue_id}")
+        return jsonify({"status": "ignored_duplicate"}), 200
 
-    status_raw = data.get("state", {}).get("name")
-    prioridade_raw = data.get("priority")
+    # Envio imediato apenas para delecao
+    if action == "deleted":
+        print(f"[imediato] Tarefa deletada {issue_id}")
+        enviar_google_chat(payload)
+        marcar_status_sheet(issue_id, "enviado")
+        return jsonify({"status": "ok_imediato"}), 200
 
-    status = traduzir(status_raw, STATUS_MAP)
-    prioridade = traduzir(prioridade_raw, PRIORITY_MAP)
-
-    pontos = normalizar(data.get("point"))
-
-    responsaveis = lista_para_texto(
-        data.get("assignees", []),
-        campo="display_name",
-        padrao="Não atribuído"
-    )
-
-    labels = lista_para_texto(
-        data.get("labels", []),
-        campo="name",
-        padrao="Nenhuma"
-    )
-
-    inicio = normalizar(data.get("start_date"), "—")
-
-    # 👉 Prazo / Finalizado
-    if status == "Finalizado":
-        prazo_label = "Finalizado em"
-        prazo = normalizar(data.get("updated_at"), "—")
-    else:
-        prazo_label = "Prazo"
-        prazo = normalizar(data.get("target_date"), "—")
-
-    autor = activity.get("actor", {}).get("display_name", "Usuário")
-
-    # =================================================
-    # Título do Card
-    # =================================================
-
-    if action == "created":
-        header_title = "🆕 Nova Tarefa Criada"
-    elif action == "updated":
-        header_title = "✏️ Tarefa Atualizada"
-    elif action == "deleted":
-        header_title = "🗑️ Tarefa Removida"
-    else:
-        header_title = "📌 Evento de Tarefa"
-
-    # =================================================
-    # Card Google Chat (Cards V2)
-    # =================================================
-
-    mensagem = {
-        "cardsV2": [
-            {
-                "cardId": "plane-issue",
-                "card": {
-                    "header": {
-                        "title": header_title,
-                        "subtitle": f"#{numero} • {titulo}",
-                        "imageUrl": "https://www.gstatic.com/images/icons/material/system/1x/assignment_googblue_48dp.png"
-                    },
-                    "sections": [
-                        {
-                            "widgets": [
-                                {"decoratedText": {"topLabel": "Status", "text": status}},
-                                {"decoratedText": {"topLabel": "Prioridade", "text": prioridade}},
-                                {"decoratedText": {"topLabel": "Responsável", "text": responsaveis}},
-                                {"decoratedText": {"topLabel": "Labels", "text": labels}},
-                            ]
-                        },
-                        {
-                            "widgets": [
-                                {"decoratedText": {"topLabel": "Pontos", "text": str(pontos)}},
-                                {"decoratedText": {"topLabel": "Início", "text": inicio}},
-                                {"decoratedText": {"topLabel": prazo_label, "text": prazo}},
-                            ]
-                        },
-                        {
-                            "widgets": [
-                                {
-                                    "textParagraph": {
-                                        "text": f"<i>Atualizado por {autor}</i>"
-                                    }
-                                }
-                            ]
-                        }
-                    ]
-                }
-            }
-        ]
-    }
-
-    # =================================================
-    # Envio ao Google Chat
-    # =================================================
-
-    resp = requests.post(
-        GOOGLE_CHAT_WEBHOOK,
-        json=mensagem,
-        headers={"Content-Type": "application/json; charset=UTF-8"},
-        timeout=5
-    )
-
-    print("Google Chat status:", resp.status_code)
-
-    return jsonify({"status": "ok"}), 200
+    # Debounce: criacao, edicoes e mudancas de status aguardam 30s
+    salvar_pendente(issue_id, payload)
+    print(f"[debounce] Issue {issue_id} salva/atualizada na fila")
+    return jsonify({"status": "ok_debounce"}), 200
 
 
 # =====================================================
@@ -221,4 +478,4 @@ def plane_webhook():
 # =====================================================
 
 if __name__ == "__main__":
-    app.run(port=5000, debug=True)
+    app.run(port=5500, debug=True)
