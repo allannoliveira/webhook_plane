@@ -174,191 +174,6 @@ def lista_para_texto(lista, campo="name", padrao="Nenhuma"):
     return ", ".join(valores) if valores else padrao
 
 
-# =====================================================
-# Montar e enviar card Google Chat
-# =====================================================
-
-def enviar_google_chat(dados: dict):
-    action   = dados.get("action")
-    data     = dados.get("data", {})
-    activity = dados.get("activity", {})
-
-    numero         = normalizar(data.get("sequence_id"))
-    titulo         = normalizar(data.get("name"), "Sem titulo")
-    status_raw     = data.get("state", {}).get("name")
-    prioridade_raw = data.get("priority")
-    status         = traduzir(status_raw, STATUS_MAP)
-    prioridade     = traduzir(prioridade_raw, PRIORITY_MAP)
-    pontos         = normalizar(data.get("point"))
-    responsaveis   = lista_para_texto(data.get("assignees", []), campo="display_name", padrao="Nao atribuido")
-    labels         = lista_para_texto(data.get("labels", []), campo="name", padrao="Nenhuma")
-    inicio         = normalizar(data.get("start_date"), "-")
-    autor          = activity.get("actor", {}).get("display_name", "Usuario")
-
-    status_emoji    = STATUS_EMOJI.get(status, "📌")
-    prioridade_emoji = PRIORITY_EMOJI.get(prioridade, "")
-
-    if status == "Finalizado":
-        prazo_label = "Finalizado em"
-        prazo = normalizar(data.get("updated_at"), "-")
-    else:
-        prazo_label = "Prazo"
-        prazo = normalizar(data.get("target_date"), "-")
-
-    # Titulo do header por acao
-    if action == "created":
-        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/add_task/default/48px.svg"
-        header_title = "Nova Tarefa Criada"
-        header_color = "#0F9D58"
-    elif action == "updated":
-        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/edit/default/48px.svg"
-        header_title = "Tarefa Atualizada"
-        header_color = "#4285F4"
-    elif action == "deleted":
-        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/delete/default/48px.svg"
-        header_title = "Tarefa Removida"
-        header_color = "#EA4335"
-    else:
-        header_icon  = "https://fonts.gstatic.com/s/i/short-term/release/materialsymbolsoutlined/task/default/48px.svg"
-        header_title = "Evento de Tarefa"
-        header_color = "#9E9E9E"
-
-    # Linha de prioridade com emoji
-    prioridade_texto = f"{prioridade_emoji} {prioridade}".strip() if prioridade_emoji else prioridade
-
-    # Linha de pontos
-    pontos_texto = f"🎯 {pontos}" if pontos != "N/A" else "🎯 Sem estimativa"
-
-    # Responsavel
-    responsaveis_texto = f"👤 {responsaveis}"
-
-    # Labels
-    labels_texto = f"🏷️ {labels}"
-
-    # Datas
-    inicio_texto = f"📅 Inicio: {inicio}"
-    prazo_texto  = f"⏰ {prazo_label}: {prazo}"
-
-    # Rodape
-    rodape = f"✏️ Atualizado por <b>{autor}</b>"
-
-    mensagem = {
-        "cardsV2": [{
-            "cardId": "plane-issue",
-            "card": {
-                "header": {
-                    "title": f"<b>{header_title}</b>",
-                    "subtitle": f"#{numero}  •  {titulo}",
-                    "imageUrl": header_icon,
-                    "imageType": "CIRCLE"
-                },
-                "sections": [
-                    {
-                        # Bloco principal: status + titulo destacado
-                        "widgets": [
-                            {
-                                "textParagraph": {
-                                    "text": f"<b>{titulo}</b>"
-                                }
-                            },
-                            {
-                                "decoratedText": {
-                                    "startIcon": {"knownIcon": "BOOKMARK"},
-                                    "topLabel": "Status",
-                                    "text": f"{status_emoji}  <b>{status}</b>"
-                                }
-                            },
-                            {
-                                "decoratedText": {
-                                    "startIcon": {"knownIcon": "STAR"},
-                                    "topLabel": "Prioridade",
-                                    "text": prioridade_texto
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        # Bloco secundario: responsavel, labels, pontos
-                        "widgets": [
-                            {
-                                "decoratedText": {
-                                    "startIcon": {"knownIcon": "PERSON"},
-                                    "topLabel": "Responsavel",
-                                    "text": responsaveis
-                                }
-                            },
-                            {
-                                "decoratedText": {
-                                    "startIcon": {"knownIcon": "DESCRIPTION"},
-                                    "topLabel": "Labels",
-                                    "text": labels
-                                }
-                            },
-                            {
-                                "decoratedText": {
-                                    "startIcon": {"knownIcon": "FLIGHT_ARRIVAL"},
-                                    "topLabel": "Pontos",
-                                    "text": str(pontos)
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        # Bloco de datas
-                        "widgets": [
-                            {
-                                "columns": {
-                                    "columnItems": [
-                                        {
-                                            "horizontalSizeStyle": "FILL_AVAILABLE_SPACE",
-                                            "widgets": [{
-                                                "decoratedText": {
-                                                    "startIcon": {"knownIcon": "INVITE"},
-                                                    "topLabel": "Inicio",
-                                                    "text": inicio
-                                                }
-                                            }]
-                                        },
-                                        {
-                                            "horizontalSizeStyle": "FILL_AVAILABLE_SPACE",
-                                            "widgets": [{
-                                                "decoratedText": {
-                                                    "startIcon": {"knownIcon": "CLOCK"},
-                                                    "topLabel": prazo_label,
-                                                    "text": prazo
-                                                }
-                                            }]
-                                        }
-                                    ]
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        # Rodape
-                        "widgets": [
-                            {
-                                "textParagraph": {
-                                    "text": rodape
-                                }
-                            }
-                        ]
-                    }
-                ]
-            }
-        }]
-    }
-
-    resp = requests.post(
-        GOOGLE_CHAT_WEBHOOK,
-        json=mensagem,
-        headers={"Content-Type": "application/json; charset=UTF-8"},
-        timeout=5
-    )
-    print("Google Chat status:", resp.status_code)
-    if resp.status_code != 200:
-        print("Google Chat response:", resp.text)
-
 
 # =====================================================
 # Background worker -- verifica debounce a cada 10s
@@ -380,6 +195,7 @@ def worker_debounce():
 
                 issue_id, ultimo_evento_str, dados_json, status_enviado = row[:4]
 
+                # 🔥 só processa pendente
                 if status_enviado != "pendente":
                     continue
 
@@ -391,10 +207,11 @@ def worker_debounce():
                 if ultimo_evento.tzinfo is None:
                     ultimo_evento = ultimo_evento.replace(tzinfo=timezone.utc)
 
+                # ⏱️ debounce
                 if (agora - ultimo_evento).total_seconds() < DEBOUNCE_SEGUNDOS:
                     continue
 
-                # Bloqueia em memoria para evitar duplo disparo entre ciclos
+                # 🔒 evita concorrência
                 with _processando_lock:
                     if issue_id in _issues_processando:
                         continue
@@ -403,21 +220,26 @@ def worker_debounce():
                 marcar_status_sheet(issue_id, "processando")
 
                 try:
-                    dados = json.loads(dados_json)
-                    enviar_google_chat(dados)
-                    marcar_status_sheet(issue_id, "enviado")
-                    print(f"[debounce] Alerta enviado para issue {issue_id}")
+                    # 🔥 NÃO envia mais nada
+                    # apenas valida JSON
+                    json.loads(dados_json)
+
+                    # ✅ pronto pro Apps Script
+                    marcar_status_sheet(issue_id, "processado")
+
+                    print(f"[debounce] Issue pronta para Apps Script {issue_id}")
+
                 except Exception as e:
                     marcar_status_sheet(issue_id, "pendente")
-                    print(f"[debounce] Erro ao enviar issue {issue_id}: {e}")
+                    print(f"[debounce] Erro issue {issue_id}: {e}")
+
                 finally:
                     with _processando_lock:
                         _issues_processando.discard(issue_id)
 
         except Exception as e:
             print(f"[worker_debounce] Erro geral: {e}")
-
-
+            
 threading.Thread(target=worker_debounce, daemon=True).start()
 
 
